@@ -20,12 +20,17 @@ from powerfoam.geometry import normals_from_depth, depth_bilateral_filter
 from powerfoam.scheduling import get_exp_scheduler, get_cosine_scheduler
 from powerfoam.metrics import psnr, ssim, ssim_eval, lpips_eval
 from powerfoam.distortion import exact_distortion, stratified_thresholds
-
-torch.manual_seed(42)
-np.random.seed(42)
+from powerfoam.facet_normal import facet_normal_loss
+from powerfoam.normal_consistency import depth_normal_consistency_loss
 
 
 def train(args):
+    # Was a hardcoded torch.manual_seed(42)/np.random.seed(42) at module level (i.e. before
+    # args existed at all, so it could never be anything but 42). Default is still 42, so any
+    # run that doesn't pass --seed is bit-identical to before this became configurable.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     wp.init()
 
     # Setting up output directory
@@ -295,29 +300,21 @@ def train(args):
                         median_depth_slice = depth[..., q_median_idx : q_median_idx + 1]
                         valid_depth_mask = (median_depth_slice > 0).all(dim=-1)
                         if args.use_metric3d:
-                            normal_loss += (
-                                F.mse_loss(
-                                    normal[valid_depth_mask],
-                                    normal_gt[valid_depth_mask],
-                                )
-                                * 1e-1
-                            )
+                            target_normals = normal_gt
                         else:
                             median_depth = depth_bilateral_filter(
                                 median_depth_slice,
                                 sigma_spatial=sigma_spatial_scheduler(i),
                                 sigma_color=0.5,
                             )
-                            est_normals = normals_from_depth(
-                                camera, median_depth.detach()
-                            )
-                            normal_loss += (
-                                F.mse_loss(
-                                    normal[valid_depth_mask],
-                                    est_normals[valid_depth_mask],
-                                )
-                                * 1e-1
-                            )
+                            # No .detach(): letting this depth carry gradient lets the
+                            # consistency term also reshape geometry (points/radii/density),
+                            # not only the free per-primitive normal.
+                            target_normals = normals_from_depth(camera, median_depth)
+                        normal_loss = normal_loss + depth_normal_consistency_loss(
+                            normal, alpha, valid_depth_mask, target_normals,
+                            min_alpha=args.normal_supervision_min_alpha,
+                        ) * 1e-1
                     w_normal = normal_loss_scheduler(i)
                     torch.cuda.nvtx.range_pop()  # Normal
 
@@ -386,6 +383,22 @@ def train(args):
                     w_interpenetration = interpenetration_loss_scheduler(i)
                     torch.cuda.nvtx.range_pop()  # Interpenetration
 
+                    torch.cuda.nvtx.range_push("FacetNormal")
+                    if args.facet_normal_weight > 0.0:
+                        facet_normal_loss_val = facet_normal_loss(
+                            model.get_normals(),
+                            model.points,
+                            model.get_density(),
+                            model.get_radii(),
+                            model.adjacency,
+                            model.adjacency_offsets,
+                            min_contrast=args.facet_normal_min_contrast,
+                            grad_to_geometry=args.facet_normal_grad_to_geometry,
+                        )
+                    else:
+                        facet_normal_loss_val = None
+                    torch.cuda.nvtx.range_pop()  # FacetNormal
+
                     loss = (
                         rgb_loss
                         + w_ssim * ssim_loss
@@ -393,6 +406,8 @@ def train(args):
                         + w_contrib * contrib_loss
                         + w_interpenetration * interpenetration_loss
                     )
+                    if facet_normal_loss_val is not None:
+                        loss = loss + args.facet_normal_weight * facet_normal_loss_val
                     # CHANNEL CONTROL -- the power-diagram-native experiment.
                     # VoroTracing routes the distortion gradient to DENSITY ONLY, because a
                     # midpoint bisector cannot move without moving a site and dragging every
@@ -465,6 +480,10 @@ def train(args):
                     writer.add_scalar(
                         "train/distortion_loss", float(distortion_loss), i
                     )
+                    if facet_normal_loss_val is not None:
+                        writer.add_scalar(
+                            "train/facet_normal_loss", facet_normal_loss_val.item(), i
+                        )
 
                     num_points = model.points.shape[0]
                     writer.add_scalar("test/num_points", num_points, i)

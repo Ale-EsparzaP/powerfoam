@@ -151,11 +151,44 @@ class Params:
     viewer: bool = False
     # Enable external normal supervision.  When False (default), the only
     # normal-related term in the loss is the renderer's internal
-    # ``normal_err`` regulariser.  When True, an additional MSE supervision
-    # term is added against either Metric3D normals (if ``use_metric3d`` is
-    # also True) or finite-difference normals computed from the rendered
-    # depth map.
+    # ``normal_err`` regulariser.  When True, an additional supervision term
+    # is added against either Metric3D normals (if ``use_metric3d`` is also
+    # True) or finite-difference normals computed from the rendered depth
+    # map (the depth-normal consistency idea).
+    #
+    # CORRECTNESS FIX (2026-09-14): this term used to be an MSE between the
+    # composited per-pixel `normal` (whose magnitude is accumulated opacity,
+    # not 1) and a unit-length target -- minimised partly by raising opacity,
+    # not by orientation. Now a cosine loss on the NORMALISED composited
+    # normal, masked to `normal_supervision_min_alpha` accumulated opacity so
+    # the loss only ever grades orientation where there is enough evidence to
+    # have one. The target's own depth estimate is no longer detached, so
+    # gradients can also reshape geometry (points/radii/density), not only
+    # the free per-primitive normal.
     normal_supervision: bool = False
+    normal_supervision_min_alpha: float = 0.5
+
+    # Facet-normal coupling (OFF at weight 0.0 -- bit-identical to before it existed). See
+    # powerfoam/facet_normal.py for the full motivation: it is an orientation term built from
+    # occupancy-contrast-weighted facet directions to a primitive's adjacency neighbours -- an
+    # exact geometric fact about a power diagram, not a learned quantity -- pulling the free
+    # quaternion normal's AXIS (not sign) toward it. NOTE (2026-09-14): tested in isolation on
+    # real checkpoints and found NOT to recover true orientation (the occupancy pattern does
+    # not track the true surface in a trained density field, even on frozen/GT-position
+    # geometry) -- see MyResearchVault/Stage0-Surface-Prior-Art.md. Kept for completeness /
+    # possible reuse of the mechanism, not because it is known to help.
+    facet_normal_weight: float = 0.0
+    facet_normal_min_contrast: float = 1e-3
+    # False (default): target is built under no_grad, so the loss only moves the quaternions.
+    # True: gradients also flow into points/radii/density. NOTE: add_group() asserts every
+    # bool field defaults to False, so this is phrased as the opt-IN direction rather than
+    # "detach_target: bool = True".
+    facet_normal_grad_to_geometry: bool = False
+
+    # RNG seed for reproducibility checks. Default 42 matches the value that used to be
+    # hardcoded at train.py's module level (torch.manual_seed(42)/np.random.seed(42)) --
+    # unspecified runs are bit-identical to before this flag existed.
+    seed: int = 42
 
     # Dataset parameters
     dataset: str

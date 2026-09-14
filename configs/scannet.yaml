@@ -35,7 +35,15 @@ sv_dof: 8
 num_texel_sites: 8
 
 # Optimization parameters
-points_lr_init: 1e-3
+# points_lr_init was 1e-3 (the historical default, inherited unchanged since this config's
+# creation). Measured 2026-09-14 to be roughly 10x too high: with densification enabled (this
+# config's own default schedule, not the coauthor's densify-off sweep), 1e-4 cuts CD-L1 by a
+# mean of 57% across 4 scenes (scene0070_00/scene0062_00/scene0347_00/scene0200_00, range
+# -47% to -62%, unanimous direction) at a small PSNR cost (~1dB on the 2 scenes checked). See
+# MyResearchVault/Stage0-Surface-Prior-Art.md for the full result, including the important
+# caveat that normal/orientation accuracy is UNCHANGED by this fix (a separate, still-open
+# problem) -- confirmed flat on all 4 scenes too.
+points_lr_init: 1e-4
 points_lr_final: 5e-5
 density_lr_init: 1e0
 density_lr_final: 1e0

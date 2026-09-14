@@ -28,10 +28,28 @@ def _segment_exclusive_cumsum(values: torch.Tensor, group_ids: torch.Tensor, gro
     """sum of `values[j]` for all j before i within the same group as i, for
     every i, given `values`/`group_ids` already sorted so each group is
     contiguous. `group_start_idx[g]` is the index of group g's first element.
+
+    Computed in float64: `global_cumsum` runs over the WHOLE array (tens of
+    millions of elements at real scene scale, not just one row), and this
+    function's own per-row answer is `global_cumsum - base`, a difference of
+    two numbers of comparable (and, at scale, large) magnitude -- exactly the
+    catastrophic-cancellation shape already seen once in this project
+    (opacity_override_sweep.py's global cumsum bug, see project notes). At
+    ~40M nnz/view here (vs. the self-test's ~76k), float32's ~7 significant
+    digits stop resolving individual per-nonzero log(1-alpha) increments
+    (~1e-3 to ~7) once the running sum reaches ~1e7 in magnitude, which
+    silently corrupted every row's recovered transmittance past that point --
+    caught by comparing a real-checkpoint render against gsplat's own forward
+    pass (max abs alpha error ~275 on a value that must lie in [0,1]; the
+    small synthetic self-test's global cumsum never gets large enough to
+    trigger this, so it passed cleanly). float64 pushes the same failure mode
+    out to ~1e15-1e16 in magnitude, comfortably beyond any realistic
+    per-view nnz count.
     """
-    global_cumsum = torch.cumsum(values, dim=0)
-    base = global_cumsum[group_start_idx] - values[group_start_idx]
-    return global_cumsum - values - base[group_ids]
+    values64 = values.double()
+    global_cumsum = torch.cumsum(values64, dim=0)
+    base = global_cumsum[group_start_idx] - values64[group_start_idx]
+    return (global_cumsum - values64 - base[group_ids]).to(values.dtype)
 
 
 @torch.no_grad()
