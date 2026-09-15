@@ -22,6 +22,8 @@ from powerfoam.metrics import psnr, ssim, ssim_eval, lpips_eval
 from powerfoam.distortion import exact_distortion, stratified_thresholds
 from powerfoam.facet_normal import facet_normal_loss
 from powerfoam.normal_consistency import depth_normal_consistency_loss
+from powerfoam.multiview_consistency import multiview_planar_ncc_loss
+from powerfoam.camera import TorchCamera
 
 
 def train(args):
@@ -65,6 +67,26 @@ def train(args):
     train_data_handler.reload(train_split, downsample=args.downsample[0])
     train_data_iter = train_data_handler.get_iter()
     print("Loaded dataset")
+
+    def build_cam_eyes(handler):
+        # One-time (well, once per reload) (V, 3) table of camera positions, used to pick a
+        # nearby source view for the multi-view NCC loss without tracking which index the data
+        # iterator drew -- cameras are re-fetched by identity below via their own .eye, not index.
+        return torch.stack([c.eye for c in handler.cameras]).cuda()
+
+    train_cam_eyes = build_cam_eyes(train_data_handler) if args.multiview_ncc_weight > 0 else None
+
+    def camera_to_cuda_light(cam):
+        # `TorchCamera.to_device` also moves `ray_maps` (a full H*W*6 per-pixel tensor), which
+        # `multiview_consistency.py` never reads (it only uses .eye/.right/.up/.width/.height) --
+        # skip it here so the multi-view loss doesn't pay a needless per-iteration PCIe transfer.
+        return TorchCamera(
+            eye=cam.eye.cuda(non_blocking=True),
+            right=cam.right.cuda(non_blocking=True),
+            up=cam.up.cuda(non_blocking=True),
+            width=cam.width,
+            height=cam.height,
+        )
 
     # Setting up model
     model = PowerfoamScene(args)
@@ -145,7 +167,7 @@ def train(args):
             writer.add_scalar("test/ssim", average_ssim, step)
 
     def train_loop():
-        nonlocal train_data_iter
+        nonlocal train_data_iter, train_cam_eyes
 
         print("Starting training")
         iters_since_triangulation = 0
@@ -187,6 +209,8 @@ def train(args):
                     downsample = args.downsample[downsample_idx]
                     train_data_handler.reload(train_split, downsample=downsample)
                     train_data_iter = train_data_handler.get_iter()
+                    if args.multiview_ncc_weight > 0:
+                        train_cam_eyes = build_cam_eyes(train_data_handler)
 
                 torch.cuda.nvtx.range_push("Train Step")
                 torch.cuda.nvtx.range_push("Loading Data")
@@ -233,8 +257,12 @@ def train(args):
                     #   2. A HIGH threshold (0.9) is crossed EARLY => near depth; a LOW one
                     #      (0.1) is crossed late => far depth. So the interval width is
                     #      depth(low) - depth(high), not the other way round.
+                    multiview_ncc_active = args.multiview_ncc_weight > 0 and i >= int(
+                        args.multiview_ncc_start_frac * args.iterations
+                    )
+
                     q_list, q_median_idx, q_near_idx, q_far_idx = [], None, None, None
-                    if args.normal_supervision:
+                    if args.normal_supervision or multiview_ncc_active:
                         q_list.append(0.5)
                     exact_dist = (args.distortion_weight > 0
                                   and args.distortion_mode == "exact")
@@ -250,7 +278,7 @@ def train(args):
                         q_list.extend([t_far, t_near])
                     if q_list:
                         q_list = sorted(set(q_list), reverse=True)   # DESCENDING, required
-                        if args.normal_supervision:
+                        if args.normal_supervision or multiview_ncc_active:
                             q_median_idx = q_list.index(0.5)
                         if exact_dist:
                             q_exact_idx = [q_list.index(v) for v in q_exact]
@@ -399,6 +427,54 @@ def train(args):
                         facet_normal_loss_val = None
                     torch.cuda.nvtx.range_pop()  # FacetNormal
 
+                    torch.cuda.nvtx.range_push("MultiviewNCC")
+                    if multiview_ncc_active:
+                        # Restrict candidate patch centres to sufficiently opaque pixels by
+                        # zeroing depth elsewhere -- multiview_planar_ncc_loss already treats
+                        # non-positive depth as "no candidate here", so this reuses that check
+                        # instead of threading a second mask through the (already tested,
+                        # deliberately untouched) loss module.
+                        median_depth_map = depth[..., q_median_idx]  # (H, W)
+                        ref_depth_masked = torch.where(
+                            alpha > args.multiview_ncc_min_alpha,
+                            median_depth_map,
+                            torch.zeros_like(median_depth_map),
+                        )
+
+                        cur_eye = camera.eye.cuda(non_blocking=True)
+                        dists = (train_cam_eyes - cur_eye[None, :]).norm(dim=-1)
+                        candidates = torch.nonzero(dists > 1e-6, as_tuple=True)[0]
+                        if candidates.numel() > 0:
+                            k = min(args.multiview_ncc_num_neighbors, candidates.numel())
+                            nearest = candidates[torch.topk(dists[candidates], k, largest=False).indices]
+                            src_idx = int(nearest[torch.randint(k, (1,)).item()].item())
+
+                            ref_camera_cuda = camera_to_cuda_light(camera)
+                            src_camera_cuda = camera_to_cuda_light(train_data_handler.cameras[src_idx])
+                            src_image = train_data_handler.rgbs[src_idx].cuda(non_blocking=True)
+
+                            multiview_ncc_loss_val = multiview_planar_ncc_loss(
+                                ref_camera_cuda,
+                                rgb_gt,
+                                ref_depth_masked,
+                                normal,
+                                src_camera_cuda,
+                                src_image,
+                                patch_radius=args.multiview_ncc_patch_radius,
+                                num_patches=args.multiview_ncc_num_patches,
+                            )
+                            if i % 100 == 0:
+                                n_valid_ref = int((ref_depth_masked > 0).sum())
+                                print(f"[multiview_ncc] iter {i}: valid_ref_pixels={n_valid_ref} "
+                                      f"of {ref_depth_masked.numel()} src_idx={src_idx} "
+                                      f"loss={float(multiview_ncc_loss_val):.6f}", flush=True)
+                        else:
+                            # Only possible with a single-view training set; nothing to warp to.
+                            multiview_ncc_loss_val = None
+                    else:
+                        multiview_ncc_loss_val = None
+                    torch.cuda.nvtx.range_pop()  # MultiviewNCC
+
                     loss = (
                         rgb_loss
                         + w_ssim * ssim_loss
@@ -408,6 +484,8 @@ def train(args):
                     )
                     if facet_normal_loss_val is not None:
                         loss = loss + args.facet_normal_weight * facet_normal_loss_val
+                    if multiview_ncc_loss_val is not None:
+                        loss = loss + args.multiview_ncc_weight * multiview_ncc_loss_val
                     # CHANNEL CONTROL -- the power-diagram-native experiment.
                     # VoroTracing routes the distortion gradient to DENSITY ONLY, because a
                     # midpoint bisector cannot move without moving a site and dragging every
@@ -483,6 +561,10 @@ def train(args):
                     if facet_normal_loss_val is not None:
                         writer.add_scalar(
                             "train/facet_normal_loss", facet_normal_loss_val.item(), i
+                        )
+                    if multiview_ncc_loss_val is not None:
+                        writer.add_scalar(
+                            "train/multiview_ncc_loss", multiview_ncc_loss_val.item(), i
                         )
 
                     num_points = model.points.shape[0]

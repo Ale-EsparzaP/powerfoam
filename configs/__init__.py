@@ -185,6 +185,37 @@ class Params:
     # "detach_target: bool = True".
     facet_normal_grad_to_geometry: bool = False
 
+    # Multi-view planar-patch NCC consistency ("idea C" -- OFF at weight 0.0, bit-identical to
+    # before it existed). See powerfoam/multiview_consistency.py for the full derivation: warps a
+    # small patch around a reference pixel through the LOCAL TANGENT PLANE its rendered depth+
+    # normal define, into a randomly chosen nearby source view, and scores photometric agreement
+    # via zero-mean normalised cross-correlation (robust to inter-view exposure/lighting, unlike
+    # raw MSE). Unlike `normal_supervision`, which only ever checks a view's own rendering against
+    # itself, this is a genuinely independent multi-view signal: it only agrees at pixels whose
+    # depth+normal are actually consistent with what a SECOND real photograph shows there.
+    # Cost-controlled per the project plan: enabled only for the last
+    # `1 - multiview_ncc_start_frac` of training (geometry is too unstable early on for a patch
+    # match to mean anything), one randomly chosen nearby source view per iteration (not all
+    # pairs), and a bounded random subset of patches (`multiview_ncc_num_patches`), not a dense
+    # per-pixel warp.
+    multiview_ncc_weight: float = 0.0
+    # Patch side length is 2*radius+1. Kept small (a handful of pixels): the tangent-plane patch
+    # construction is only a first-order approximation to the true (possibly curved) surface away
+    # from the fronto-parallel case, so a large patch would warp increasingly inaccurately even at
+    # perfectly correct depth/normal.
+    multiview_ncc_patch_radius: int = 2
+    multiview_ncc_num_patches: int = 256
+    # How many of the current view's nearest neighbours (by camera position) to draw the single
+    # source view from -- a random pick among the K nearest, not always the single nearest, so
+    # training sees more than one fixed pair per reference view over the course of training.
+    multiview_ncc_num_neighbors: int = 8
+    # Fraction of `iterations` after which this loss turns on (0.75 => last 25%).
+    multiview_ncc_start_frac: float = 0.75
+    # Reference pixels are only offered as patch centres where accumulated opacity clears this
+    # threshold -- a low-opacity pixel's depth/normal are not yet meaningful evidence about a
+    # surface, matching `normal_supervision_min_alpha`'s role for the other orientation loss.
+    multiview_ncc_min_alpha: float = 0.5
+
     # RNG seed for reproducibility checks. Default 42 matches the value that used to be
     # hardcoded at train.py's module level (torch.manual_seed(42)/np.random.seed(42)) --
     # unspecified runs are bit-identical to before this flag existed.
